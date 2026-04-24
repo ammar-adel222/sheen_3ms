@@ -1,0 +1,92 @@
+# =========================
+# Inference-only cell: generate omar.json from hidden test
+# Requires trained objects already in memory:
+# aspect_trainer, trainer_sent, aspect_tok, sent_tok, thresholds,
+# ASPECTS, SENTIMENTS, id2sent, MAX_LEN and helper funcs used below.
+# =========================
+
+HIDDEN_PATH = "/kaggle/input/datasets/omarsayed105/tesssssst/DeepX_hidden_test (3).xlsx"
+OUTPUT_JSON = "/kaggle/working/omar.json"
+
+if not os.path.exists(HIDDEN_PATH):
+    raise FileNotFoundError(f"Hidden test file not found: {HIDDEN_PATH}")
+
+# Load all rows from hidden test
+infer_df = load_unlabeled(HIDDEN_PATH).copy().reset_index(drop=True)
+print("inference_rows:", len(infer_df), "source:", HIDDEN_PATH)
+
+# Predict aspect probabilities
+infer_probs = predict_aspect_probs(infer_df)
+
+pred_aspects, uncertain_flags = [], []
+for i in range(len(infer_df)):
+    row_i = infer_df.iloc[i]
+    clean_txt = row_i["clean_text"]
+    score_map = {a: float(infer_probs[i, j]) for j, a in enumerate(ASPECTS)}
+
+    short_aspects, _ = short_text_general_rule(clean_txt)
+    chosen = short_aspects if short_aspects is not None else decode_aspects(clean_txt, score_map, row_i)
+
+    pred_aspects.append(chosen)
+    uncertain_flags.append(is_uncertain(clean_txt, score_map, chosen))
+
+# Build (text, aspect) pairs for sentiment model
+pairs, pair_index = [], []
+for i, aspects in enumerate(pred_aspects):
+    model_text_i = infer_df.iloc[i]["model_text"]
+    for a in aspects:
+        pairs.append((model_text_i, a))
+        pair_index.append((i, a))
+
+pred_sents = predict_sentiments(pairs)
+
+# Map predicted sentiments back by row/aspect
+sent_map = {}
+for (i, a), s in zip(pair_index, pred_sents):
+    sent_map.setdefault(i, {})[a] = s
+
+# Build final records in exact schema
+records = []
+for i in range(len(infer_df)):
+    clean_txt = infer_df.iloc[i]["clean_text"]
+
+    aspects_i = pred_aspects[i]
+    short_aspects, short_sent = short_text_general_rule(clean_txt)
+    if short_aspects is not None:
+        aspects_i = short_aspects
+
+    sent_i = {a: sent_map.get(i, {}).get(a, "neutral") for a in aspects_i}
+    sent_i.update(rule_based_sentiment_hint(clean_txt, aspects_i))
+    if short_sent is not None:
+        sent_i.update(short_sent)
+
+    base = {
+        "review_id": int(infer_df.iloc[i]["review_id"]),
+        "aspects": aspects_i,
+        "aspect_sentiments": sent_i,
+    }
+    fixed = sanitize_record(base)
+
+    # Keep exact key order and aspect-sentiment alignment
+    records.append({
+        "review_id": int(base["review_id"]),
+        "aspects": list(fixed["aspects"]),
+        "aspect_sentiments": {a: fixed["aspect_sentiments"][a] for a in fixed["aspects"]},
+    })
+
+# Validate coverage and schema
+errors = validate_predictions(records, infer_df["review_id"].astype(int).tolist())
+print("validation_errors:", len(errors))
+print("uncertain_rows:", int(sum(uncertain_flags)))
+
+if errors:
+    print("sample_errors:", errors[:10])
+else:
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    print("saved:", OUTPUT_JSON, "rows:", len(records))
+
+# Optional memory cleanup
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
