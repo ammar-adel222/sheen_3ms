@@ -1,0 +1,73 @@
+Arabic ABSA — Data Analysis & Preprocessing Guide
+1,971 training · 500 validation · 9 aspect classes · 3 sentiment labels
+
+Data overview
+Noise analysis
+Label analysis
+Preprocessing pipeline
+Key warnings
+Train samples
+1,971
+No nulls
+Val samples
+500
+No nulls
+Avg text length
+119
+chars · median 75
+Avg word count
+22
+max 267
+Multi-aspect reviews
+45.9%
+905 / 1971
+Unique businesses
+388
+67 categories
+Platforms
+Google Maps
+1,210 (61%)
+Play Store
+761 (39%)
+Star rating distribution
+★★★★★ (5)
+987 (50%)
+★ (1)
+661 (33%)
+★★★ (3)
+146 (7%)
+★★★★ (4)
+99 (5%)
+★★ (2)
+78 (4%)
+Text length distribution
+< 10 chars
+~160 reviews
+10–100 chars
+majority
+100–500 chars
+medium
+> 500 chars
+rare (max 1526)
+Sectors / domains
+Ecommerce (212)
+Restaurants — 10+ subtypes
+Transport (129)
+Travel (121)
+Entertainment (117)
+Real estate (100)
+Healthcare — clinics, hospitals
+Food delivery (82)
+Beauty salons (75)
+Pharmacies · Gyms · Retail
+Data spans 10+ sectors — your model MUST generalize across all of them, not overfit to restaurant Arabic. 
+Here's what I found after thoroughly analyzing both files. Let me walk you through the key thinking before implementation.
+What the data actually is
+You have 1,971 training reviews and 500 validation reviews, spanning 10+ sectors (restaurants, ecommerce, transport, healthcare, beauty, etc.) from two platforms — Google Maps and Play Store. Labels are perfectly consistent with zero mismatches, which is a gift.
+The 5 decisions that will make or break your F1-micro score
+1. Don't strip newlines. 18% of reviews use \n to separate aspects. That structure is signal — each line often maps to a distinct aspect. Encode newlines as a [NL] token rather than collapsing them.
+2. Don't strip emojis. A review saying جيد😔😻 is labeled negative despite جيد meaning "good" — the sad emoji overrides the word. Map emojis to sentiment tokens before processing.
+3. Address the neutral class immediately. Only 4.5% of sentiment labels are neutral (149 out of 3,333). Without class-weighted loss (approximately 5× weight on neutral) or focal loss, your model will never predict neutral. This is the most common silent killer of F1-micro in imbalanced ABSA.
+4. Use a dialectal Arabic model. The data mixes Egyptian, Gulf, Levantine, and MSA Arabic, plus some English code-switching. AraBERT v2 or CAMeL-BERT-Mix are the right choices. Standard Arabic NLP tools (Farasa, MADAMIRA) assume MSA and will fail on the dialect content.
+5. Inject platform and business_category as features. Play Store reviews → app_experience is almost guaranteed. Google Maps → physical venue aspects. These priors are free signal for aspect detection.
+The interactive widget above covers the full preprocessing pipeline with code snippets — click through the tabs for the complete picture. Use the buttons in the "Key warnings" tab to go deeper on model architecture or to generate the full preprocessing code.
