@@ -1,0 +1,766 @@
+import ast
+import gc
+import json
+import os
+import random
+import re
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from torch.utils.data import Dataset
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+)
+
+# -------------------------
+# Config
+# -------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available()
+    torch.cuda.manual_seed_all(SEED)
+
+ASPECTS    = [food, service, price, cleanliness, delivery, ambiance, app_experience, general, none]
+SENTIMENTS = [positive, negative, neutral]
+sent2id    = {s i for i, s in enumerate(SENTIMENTS)}
+id2sent    = {i s for s, i in sent2id.items()}
+
+ASPECT_BASE_MODEL = UBC-NLPMARBERT
+SENT_BASE_MODEL   = UBC-NLPMARBERT
+MAX_LEN           = 128
+BATCH_SIZE        = 8
+GRAD_ACCUM        = 2
+EPOCHS_ASPECT     = 10
+EPOCHS_SENT       = 7
+ASPECT_LR         = 1.5e-4
+SENT_LR           = 8e-5
+WEIGHT_DECAY      = 0.01
+LORA_R            = 32
+LORA_ALPHA        = 64
+LORA_DROPOUT      = 0.1
+TARGET_MODULES    = [query, key, value]
+
+TRAIN_PATH    = kaggleinputdatasetsammaradel1111178datasett1111178DeepX_train.xlsx
+VAL_PATH      = kaggleinputdatasetsammaradel1111178datasett1111178DeepX_validation.xlsx
+UNLABELED_PATH = kaggleinputdatasetsammaradel1111178datasett1111178DeepX_unlabeled.xlsx
+HIDDEN_PATH   = hidden_test_nolabels.xlsx
+OUTPUT_JSON   = final_submission.json
+
+STAR_TOKENS  = [[STAR_1], [STAR_2], [STAR_3], [STAR_4], [STAR_5]]
+RARE_ASPECTS = {delivery, cleanliness, none, general, price}
+
+# -------------------------
+# Text resources
+# -------------------------
+EMOJI_POS = {🙂, 😊, 😍, 🤩, 👍, ❤️, ❤, 👏, ✨}
+EMOJI_NEG = {😡, 😠, 😤, 😞, 👎, 💔, 😢, 😭}
+NEG_WORDS = {مش, مو, ما, ليس, بدون, مفيش, ولا}
+ARABIZI_MAP = {2 ء, 3 ع, 4 غ, 5 خ, 6 ط, 7 ح, 8 ق, 9 ص}
+EGY_SYNONYMS = {
+    حلو   [جميل, ممتاز],
+    وحش   [سيء, رديء],
+    كويس  [جيد, مناسب],
+    غالي  [مرتفع, مكلف],
+    رخيص  [اقتصادي, منخفض],
+    نضيف  [نظيف, مرتب],
+}
+ASPECT_HINTS = {
+    food           {اكل, طعم, حلو, لذيذ, فطير, بيتزا, كريب, جوده, كميه, وجبه, طبق, مطعم, مشروب, قهوه},
+    service        {خدمه, ويتر, موظف, مسؤول, استقبال, تعامل, ذوق, زوق, سرعه, بطء},
+    price          {سعر, اسعار, غالي, رخيص, مناسب, مرضي, تكلفه, قيمه},
+    cleanliness    {نضيف, نظيف, نضافه, نظافه, قذر, وسخ, مرتب, تعقيم},
+    delivery       {وقت, تاخير, توصيل, وصل, استلم, مندوب, شحن, نص, ساعه, ساعتين, اوردر, طلب, دليفري, يتاخر, متاخر},
+    ambiance       {جو, قعده, ديكور, موسيقي, صوت, فرش, اتساع, راحه, مكان, جلسات},
+    app_experience {تطبيق, برنامج, تحميل, تسجيل, بطاقه, الدفع, اوبشن, واجهه, ابلكيشن, bug, crash, تهنيج},
+    general        {تجربه, ممتاز, سيء, جميل, جيده, رائع},
+}
+POS_SHORT      = {ممتاز, جميله, جميل, تحفه, رائع, روعه, perfect}
+NEG_SHORT      = {وحش, سيء, فاشل, زفت, رديء}
+CONTRAST_WORDS = {لكن, ولكن, بس, رغم, مع, ذلك}
+CATEGORY_PRIORS = {
+    مطعم      {food 0.10, service 0.07, ambiance 0.06},
+    كافيه     {food 0.08, service 0.06, ambiance 0.07},
+    فندق      {service 0.08, cleanliness 0.10, ambiance 0.07, price 0.05},
+    ecommerce {app_experience 0.11, delivery 0.10, price 0.06},
+    play_store{app_experience 0.14, delivery 0.05},
+    سوبرماركت {price 0.10, service 0.06, general 0.04},
+}
+
+# -------------------------
+# Utilities
+# -------------------------
+def normalize_arabic(text str) - str
+    text =  if not isinstance(text, str) else text.strip().lower()
+    for k, v in ARABIZI_MAP.items()
+        text = text.replace(k, v)
+    text = re.sub(rhttpsS+www.S+,  URL , text)
+    text = re.sub(r@w+,  USER , text)
+    text = re.sub(r#(w+), r 1 , text)
+    for e in EMOJI_POS
+        text = text.replace(e,  EMO_POS )
+    for e in EMOJI_NEG
+        text = text.replace(e,  EMO_NEG )
+    text = re.sub(r[u064B-u0652], , text)
+    text = re.sub(r[إأآٱا], ا, text)
+    text = re.sub(rى, ي, text)
+    text = re.sub(rة, ه, text)
+    text = re.sub(rؤ, و, text)
+    text = re.sub(rئ, ي, text)
+    text = re.sub(r[^ws!._-],  , text)
+    text = re.sub(r(.)1{2,}, r11, text)
+    text = re.sub(rs+,  , text).strip()
+    toks = text.split()
+    out, i = [], 0
+    while i  len(toks)
+        tk = toks[i]
+        out.append(tk)
+        if tk in NEG_WORDS and i + 1  len(toks)
+            out.append(toks[i + 1] + _NEG)
+            i += 2
+            continue
+        i += 1
+    return  .join(out)
+
+def augment_text(text str, prob float = 0.5) - str
+    if random.random()  prob
+        return text
+    toks = text.split()
+    if not toks
+        return text
+    idxs = [i for i, t in enumerate(toks) if t in EGY_SYNONYMS]
+    if idxs and random.random()  0.6
+        i = random.choice(idxs)
+        toks[i] = random.choice(EGY_SYNONYMS[toks[i]])
+    if len(toks)  6 and random.random()  0.4
+        keep = []
+        for t in toks
+            if t.startswith(EMO_) or t.endswith(_NEG) or t.startswith([)
+                keep.append(t)
+            elif random.random()  0.9
+                keep.append(t)
+        toks = keep if keep else toks
+    return  .join(toks)
+
+def parse_list(x)
+    if not (isinstance(x, str) and x.strip())
+        return []
+    try
+        z = ast.literal_eval(x)
+        return [str(v) for v in z] if isinstance(z, list) else []
+    except Exception
+        return []
+
+def parse_dict(x)
+    if not (isinstance(x, str) and x.strip())
+        return {}
+    try
+        z = ast.literal_eval(x)
+        return {str(k) str(v) for k, v in z.items()} if isinstance(z, dict) else {}
+    except Exception
+        return {}
+
+def star_token(val)
+    try
+        v = int(float(val))
+    except Exception
+        v = 3
+    v = max(1, min(5, v))
+    return f[STAR_{v}], v
+
+def build_model_text(row)
+    txt      = row.get(clean_text, )
+    platform = str(row.get(platform, unknown)).lower().strip()
+    category = normalize_arabic(str(row.get(business_category, unknown)))
+    st_tok, st_num = star_token(row.get(star_rating, 3))
+    return f{st_tok} [STAR_NUM={st_num}] [PLATFORM={platform}] [CATEGORY={category}] [TASK=ABSA] [LANG=ar-egy] {txt}
+
+def load_labeled(path, augment_train=False)
+    df = pd.read_excel(path)
+    df[review_text]           = df[review_text].fillna().astype(str)
+    df[clean_text]            = df[review_text].map(normalize_arabic)
+    df[aspects_list]          = df[aspects].map(parse_list)
+    df[aspect_sentiments_dict]= df[aspect_sentiments].map(parse_dict)
+    df[model_text]            = df.apply(build_model_text, axis=1)
+    for a in ASPECTS
+        df[fasp_{a}] = df[aspects_list].map(lambda xs int(a in xs))
+    if augment_train
+        # Generic augmentation
+        aug = df.copy()
+        aug[clean_text] = aug[clean_text].map(lambda t augment_text(t, prob=0.45))
+        aug[model_text] = aug.apply(build_model_text, axis=1)
+        aug = aug[aug[model_text].values != df[model_text].values].reset_index(drop=True)
+
+        # Rare aspect augmentation 3x
+        rare_src = df[df[aspects_list].map(lambda xs any(a in RARE_ASPECTS for a in xs))].copy()
+        rare_parts = []
+        for _ in range(3)
+            rare = rare_src.copy()
+            rare[clean_text] = rare[clean_text].map(lambda t augment_text(t, prob=0.70))
+            rare[model_text] = rare.apply(build_model_text, axis=1)
+            rare_parts.append(rare)
+        rare_combined = pd.concat(rare_parts, ignore_index=True)
+
+        parts = [df]
+        if len(aug)  0
+            parts.append(aug)
+        if len(rare_combined)  0
+            parts.append(rare_combined)
+        df = pd.concat(parts, ignore_index=True)
+    return df.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
+
+def load_unlabeled(path)
+    df = pd.read_excel(path)
+    df[review_text] = df[review_text].fillna().astype(str)
+    df[clean_text]  = df[review_text].map(normalize_arabic)
+    df[model_text]  = df.apply(build_model_text, axis=1)
+    return df
+
+def compute_warmup_steps(dataset_len, batch_size, grad_accum, epochs, warmup_ratio=0.1)
+    steps_per_epoch = max(1, int(np.ceil(dataset_len  batch_size  grad_accum)))
+    total_steps     = steps_per_epoch  epochs
+    return max(1, int(total_steps  warmup_ratio))
+
+# -------------------------
+# Datasets  Trainers
+# -------------------------
+class AspectDataset(Dataset)
+    def __init__(self, df, tokenizer, text_col=model_text, has_labels=True)
+        self.texts      = df[text_col].tolist()
+        self.tokenizer  = tokenizer
+        self.has_labels = has_labels
+        if has_labels
+            self.labels = df[[fasp_{a} for a in ASPECTS]].values.astype(np.float32)
+    def __len__(self)
+        return len(self.texts)
+    def __getitem__(self, idx)
+        enc = self.tokenizer(self.texts[idx], truncation=True, max_length=MAX_LEN)
+        if self.has_labels
+            enc[labels] = self.labels[idx].tolist()
+        return enc
+
+class SentDataset(Dataset)
+    def __init__(self, df, tokenizer)
+        self.texts     = df[text].tolist()
+        self.labels    = df[label].tolist()
+        self.tokenizer = tokenizer
+    def __len__(self)
+        return len(self.texts)
+    def __getitem__(self, idx)
+        enc = self.tokenizer(self.texts[idx], truncation=True, max_length=MAX_LEN)
+        enc[labels] = int(self.labels[idx])
+        return enc
+
+class SentPredictDataset(Dataset)
+    def __init__(self, pairs, tokenizer)
+        self.pairs     = pairs
+        self.tokenizer = tokenizer
+    def __len__(self)
+        return len(self.pairs)
+    def __getitem__(self, idx)
+        t, a = self.pairs[idx]
+        return self.tokenizer(f{t} [SEP] {a}, truncation=True, max_length=MAX_LEN)
+
+class WeightedAspectTrainer(Trainer)
+    def __init__(self, pos_weight=None, args, kwargs)
+        super().__init__(args, kwargs)
+        self.pos_weight = pos_weight
+    def compute_loss(self, model, inputs, return_outputs=False, kwargs)
+        labels  = inputs.pop(labels).float()
+        outputs = model(inputs)
+        logits  = outputs.logits
+        pw      = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
+        loss    = nn.BCEWithLogitsLoss(pos_weight=pw)(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+class WeightedSentTrainer(Trainer)
+    def __init__(self, class_weight=None, args, kwargs)
+        super().__init__(args, kwargs)
+        self.class_weight = class_weight
+    def compute_loss(self, model, inputs, return_outputs=False, kwargs)
+        labels  = inputs.pop(labels).long()
+        outputs = model(inputs)
+        logits  = outputs.logits
+        cw      = self.class_weight.to(logits.device) if self.class_weight is not None else None
+        loss    = nn.CrossEntropyLoss(weight=cw)(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+def add_star_tokens(tokenizer, model)
+    added = tokenizer.add_special_tokens({additional_special_tokens STAR_TOKENS})
+    if added  0
+        model.resize_token_embeddings(len(tokenizer))
+
+def make_lora_model(model, multilabel=False)
+    cfg = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=TARGET_MODULES,
+        bias=none,
+    )
+    model = get_peft_model(model, cfg)
+    if multilabel
+        model.config.problem_type = multi_label_classification
+    model.print_trainable_parameters()
+    return model
+
+def aspect_metrics(eval_pred)
+    logits, labels = eval_pred
+    probs = 1  (1 + np.exp(-logits))
+    preds = (probs = 0.5).astype(int)
+    return {
+        subset_accuracy accuracy_score(labels, preds),
+        micro_f1        f1_score(labels, preds, average=micro, zero_division=0),
+        macro_f1        f1_score(labels, preds, average=macro, zero_division=0),
+    }
+
+def sent_metrics(eval_pred)
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    return {
+        accuracy accuracy_score(labels, preds),
+        micro_f1 f1_score(labels, preds, average=micro, zero_division=0),
+        macro_f1 f1_score(labels, preds, average=macro, zero_division=0),
+    }
+
+# -------------------------
+# Load Data
+# -------------------------
+print(Loading data...)
+train_df = load_labeled(TRAIN_PATH, augment_train=True)
+val_df   = load_labeled(VAL_PATH,   augment_train=False)
+print(ftrain {train_df.shape}  val {val_df.shape})
+
+# Combined for final model training
+combined_df = pd.concat([
+    load_labeled(TRAIN_PATH, augment_train=True),
+    load_labeled(VAL_PATH,   augment_train=False)
+], ignore_index=True).sample(frac=1.0, random_state=SEED).reset_index(drop=True)
+print(fcombined {combined_df.shape})
+
+# -------------------------
+# Train Aspect Model
+# -------------------------
+print(n=== Training Aspect Model ===)
+aspect_tok  = AutoTokenizer.from_pretrained(ASPECT_BASE_MODEL)
+aspect_base = AutoModelForSequenceClassification.from_pretrained(
+    ASPECT_BASE_MODEL, num_labels=len(ASPECTS), problem_type=multi_label_classification
+)
+add_star_tokens(aspect_tok, aspect_base)
+aspect_model = make_lora_model(aspect_base, multilabel=True)
+
+pos_counts = combined_df[[fasp_{a} for a in ASPECTS]].sum().values.astype(np.float32)
+neg_counts = len(combined_df) - pos_counts
+pos_weight = torch.tensor(np.clip((neg_counts + 1.0)  (pos_counts + 1.0), 1.0, 12.0), dtype=torch.float32)
+
+args_aspect = TrainingArguments(
+    output_dir=kaggleworkingaspect_final,
+    learning_rate=ASPECT_LR,
+    lr_scheduler_type=cosine,
+    warmup_steps=compute_warmup_steps(len(combined_df), BATCH_SIZE, GRAD_ACCUM, EPOCHS_ASPECT, 0.1),
+    weight_decay=WEIGHT_DECAY,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    num_train_epochs=EPOCHS_ASPECT,
+    eval_strategy=epoch,
+    save_strategy=epoch,
+    save_total_limit=1,
+    load_best_model_at_end=True,
+    metric_for_best_model=micro_f1,
+    greater_is_better=True,
+    report_to=none,
+    fp16=torch.cuda.is_available(),
+    seed=SEED,
+)
+
+aspect_trainer = WeightedAspectTrainer(
+    model=aspect_model,
+    args=args_aspect,
+    train_dataset=AspectDataset(combined_df, aspect_tok, has_labels=True),
+    eval_dataset=AspectDataset(val_df, aspect_tok, has_labels=True),
+    data_collator=DataCollatorWithPadding(aspect_tok, pad_to_multiple_of=8 if torch.cuda.is_available() else None),
+    compute_metrics=aspect_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+    pos_weight=pos_weight,
+)
+aspect_trainer.train()
+print(Aspect eval, aspect_trainer.evaluate())
+
+def predict_aspect_probs(df)
+    out = aspect_trainer.predict(AspectDataset(df, aspect_tok, has_labels=False))
+    return 1  (1 + np.exp(-out.predictions))
+
+# -------------------------
+# Threshold Tuning on Val
+# -------------------------
+print(n=== Tuning Thresholds ===)
+val_probs = predict_aspect_probs(val_df)
+val_y     = val_df[[fasp_{a} for a in ASPECTS]].values
+
+def _pred_from_thresholds(probs, th_map)
+    th = np.array([th_map[a] for a in ASPECTS], dtype=np.float32)
+    return (probs = th[None, ]).astype(int)
+
+def tune_thresholds(probs, y_true)
+    th = {}
+    for i, a in enumerate(ASPECTS)
+        best_t, best_f1 = 0.5, -1
+        start = 0.25 if a in RARE_ASPECTS else 0.35
+        for t in np.arange(start, 0.80, 0.01)
+            p  = (probs[, i] = t).astype(int)
+            tp = int(((p == 1) & (y_true[, i] == 1)).sum())
+            fp = int(((p == 1) & (y_true[, i] == 0)).sum())
+            precision = tp  (tp + fp + 1e-9)
+            f = f1_score(y_true[, i], p, zero_division=0)
+            if precision = 0.35 and f  best_f1
+                best_f1, best_t = f, float(np.round(t, 2))
+            elif best_f1  0 and f  best_f1
+                best_f1, best_t = f, float(np.round(t, 2))
+        th[a] = best_t
+    # Global micro refinement
+    for _ in range(5)
+        for i, a in enumerate(ASPECTS)
+            start    = 0.25 if a in RARE_ASPECTS else 0.35
+            best_t, best_micro = th[a], -1
+            for t in np.arange(start, 0.80, 0.01)
+                cand    = dict(th)
+                cand[a] = float(np.round(t, 2))
+                micro   = f1_score(y_true, _pred_from_thresholds(probs, cand), average=micro, zero_division=0)
+                if micro  best_micro
+                    best_micro, best_t = micro, cand[a]
+            th[a] = best_t
+    th[delivery]    = min(th[delivery],    0.55)
+    th[cleanliness] = min(th[cleanliness], 0.58)
+    th[none]        = max(th[none],        0.55)
+    return th
+
+thresholds = tune_thresholds(val_probs, val_y)
+print(Thresholds, thresholds)
+
+val_preds = _pred_from_thresholds(val_probs, thresholds)
+print(fVal micro F1 after tuning {f1_score(val_y, val_preds, average='micro', zero_division=0).4f})
+print(nPer-aspect F1)
+for i, a in enumerate(ASPECTS)
+    f = f1_score(val_y[, i], val_preds[, i], zero_division=0)
+    print(f  {a20} {f.4f})
+
+# -------------------------
+# Train Sentiment Model
+# -------------------------
+print(n=== Training Sentiment Model ===)
+
+# Build sentiment rows with neutral augmentation
+sent_rows = []
+for _, r in combined_df.iterrows()
+    for a in r[aspects_list]
+        s = r[aspect_sentiments_dict].get(a)
+        if s in SENTIMENTS
+            sent_rows.append({text f{r['model_text']} [SEP] {a}, label sent2id[s]})
+            # Augment neutral 2x
+            if s == neutral
+                aug_text = augment_text(r[clean_text], prob=0.6)
+                sent_rows.append({
+                    text  f{r['model_text']} [SEP] {a} {aug_text},
+                    label sent2id[s]
+                })
+
+sent_val_rows = []
+for _, r in val_df.iterrows()
+    for a in r[aspects_list]
+        s = r[aspect_sentiments_dict].get(a)
+        if s in SENTIMENTS
+            sent_val_rows.append({text f{r['model_text']} [SEP] {a}, label sent2id[s]})
+
+sent_train_df = pd.DataFrame(sent_rows)
+sent_val_df   = pd.DataFrame(sent_val_rows)
+print(fSentiment train {len(sent_train_df)}  val {len(sent_val_df)})
+print(Label dist, sent_train_df[label].value_counts().to_dict())
+
+sent_tok  = AutoTokenizer.from_pretrained(SENT_BASE_MODEL)
+sent_base = AutoModelForSequenceClassification.from_pretrained(SENT_BASE_MODEL, num_labels=3)
+add_star_tokens(sent_tok, sent_base)
+sent_model = make_lora_model(sent_base, multilabel=False)
+
+sent_counts  = sent_train_df[label].value_counts().to_dict()
+class_weight = torch.tensor([
+    len(sent_train_df)  (3  sent_counts.get(0, 1)),
+    len(sent_train_df)  (3  sent_counts.get(1, 1)),
+    len(sent_train_df)  (3  sent_counts.get(2, 1)),
+], dtype=torch.float32)
+print(Class weights, class_weight)
+
+args_sent = TrainingArguments(
+    output_dir=kaggleworkingsent_final,
+    learning_rate=SENT_LR,
+    lr_scheduler_type=cosine,
+    warmup_steps=compute_warmup_steps(len(sent_train_df), BATCH_SIZE, GRAD_ACCUM, EPOCHS_SENT, 0.1),
+    weight_decay=WEIGHT_DECAY,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    num_train_epochs=EPOCHS_SENT,
+    eval_strategy=epoch,
+    save_strategy=epoch,
+    save_total_limit=1,
+    load_best_model_at_end=True,
+    metric_for_best_model=micro_f1,
+    greater_is_better=True,
+    report_to=none,
+    fp16=torch.cuda.is_available(),
+    seed=SEED,
+)
+
+trainer_sent = WeightedSentTrainer(
+    model=sent_model,
+    args=args_sent,
+    train_dataset=SentDataset(sent_train_df, sent_tok),
+    eval_dataset=SentDataset(sent_val_df, sent_tok),
+    data_collator=DataCollatorWithPadding(sent_tok, pad_to_multiple_of=8 if torch.cuda.is_available() else None),
+    compute_metrics=sent_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+    class_weight=class_weight,
+)
+trainer_sent.train()
+print(Sentiment eval, trainer_sent.evaluate())
+
+# -------------------------
+# Inference Helpers
+# -------------------------
+def predict_sentiments(pairs)
+    if not pairs
+        return []
+    out = trainer_sent.predict(SentPredictDataset(pairs, sent_tok))
+    return [id2sent[int(x)] for x in np.argmax(out.predictions, axis=1)]
+
+def aspect_hint_count(text, aspect)
+    return sum(1 for w in ASPECT_HINTS.get(aspect, set()) if w in text)
+
+def extract_focus_span(text)
+    for cw in CONTRAST_WORDS
+        if f {cw}  in f {text} 
+            parts = text.split(cw)
+            if len(parts) = 2 and parts[-1].strip()
+                return parts[-1].strip()
+    return text
+
+def category_bias_map(row)
+    cat      = str(row.get(business_category, )).lower().strip()
+    platform = str(row.get(platform, )).lower().strip()
+    bias     = {a 0.0 for a in ASPECTS}
+    for k, pri in CATEGORY_PRIORS.items()
+        if k in cat or k in platform
+            for a, w in pri.items()
+                bias[a] += w
+    return bias
+
+def short_text_general_rule(clean_text)
+    toks = clean_text.split()
+    if len(toks) = 2
+        if any(t in POS_SHORT for t in toks)
+            return [general], {general positive}
+        if any(t in NEG_SHORT for t in toks)
+            return [general], {general negative}
+    return None, None
+
+def rule_based_aspect_recovery(clean_text, chosen)
+    out = set(chosen)
+    if ((الدفع in clean_text) or (بطاقه in clean_text)) and 
+       any(x in clean_text for x in [لايوجد, لا يوجد, ليس])
+        out.update({app_experience, delivery})
+    if any(x in clean_text for x in [اسعار, السعر, غالي, رخيص])
+        out.add(price)
+    if (صوت in clean_text and اغاني in clean_text) or موسيقي in clean_text
+        out.add(ambiance)
+    if مسؤول in clean_text and any(x in clean_text for x in [مفيش, لايوجد, ليس])
+        out.add(service)
+    return list(out)
+
+def rule_based_sentiment_hint(clean_text, aspects)
+    hints = {}
+    if any(x in clean_text for x in [لايوجد, لا يوجد, مفيش, ليس, بدون])
+        for a in aspects
+            if a in {service, delivery, app_experience}
+                hints[a] = negative
+    if غالي in clean_text and price in aspects
+        hints[price] = negative
+    if رخيص in clean_text and price in aspects
+        hints[price] = positive
+    if صوت in clean_text and اغاني in clean_text and ambiance in aspects
+        hints[ambiance] = negative
+    return hints
+
+def decode_aspects(clean_text, score_map, row)
+    focus  = extract_focus_span(clean_text)
+    bias   = category_bias_map(row)
+    adj    = {a float(score_map[a] + bias.get(a, 0.0)) for a in ASPECTS}
+    picked = [a for a in ASPECTS if a != none and adj[a] = thresholds.get(a, 0.5)]
+    for a in ASPECTS
+        if a == none or a in picked
+            continue
+        t = thresholds.get(a, 0.5)
+        if (t - 0.06) = adj[a]  t and aspect_hint_count(focus, a) = 1
+            picked.append(a)
+    # Precision guards
+    filtered = []
+    for a in sorted(set(picked), key=lambda x adj.get(x, 0.0), reverse=True)
+        if a in {service, ambiance, app_experience}
+            if not (aspect_hint_count(clean_text, a) = 1 or adj[a] = thresholds.get(a, 0.5) + 0.08)
+                continue
+        if a == general and len(clean_text.split())  4 and aspect_hint_count(clean_text, a) == 0
+            continue
+        filtered.append(a)
+    picked = filtered
+    # Recall rescue
+    for a in [delivery, cleanliness, food, price]
+        if a not in picked and aspect_hint_count(clean_text, a) = 2 and 
+           adj[a] = max(0.22, thresholds.get(a, 0.5) - 0.12)
+            picked.append(a)
+    if not picked
+        top = max([a for a in ASPECTS if a != none], key=lambda x adj[x])
+        if adj[top] = 0.30 and aspect_hint_count(focus, top) = 1
+            picked = [top]
+        elif adj[top] = 0.43
+            picked = [top]
+        else
+            picked = [none]
+    picked = sorted(set(picked), key=lambda a adj.get(a, 0.0), reverse=True)
+    picked = rule_based_aspect_recovery(clean_text, picked)
+    picked = sorted(set(picked), key=lambda a adj.get(a, 0.0), reverse=True)
+    if len(picked)  1
+        best   = adj[picked[0]]
+        picked = [a for a in picked if adj[a] = max(0.24, best - 0.34)]
+    if none in picked and len(picked)  1
+        picked = [a for a in picked if a != none]
+    return picked
+
+def is_uncertain(clean_text, score_map, chosen)
+    vals        = np.array([score_map[a] for a in ASPECTS], dtype=np.float32)
+    entropy     = float((-vals  np.log(np.clip(vals, 1e-6, 1.0)) -
+                        (1 - vals)  np.log(np.clip(1 - vals, 1e-6, 1.0))).mean())
+    top_sorted  = sorted([score_map[a] for a in ASPECTS if a != none], reverse=True)
+    narrow_gap  = len(top_sorted) = 2 and (top_sorted[0] - top_sorted[1]  0.07)
+    weak_support= sum(aspect_hint_count(clean_text, a) for a in chosen if a != none) == 0
+    short_amb   = len(clean_text.split()) = 2 and chosen != [general]
+    too_many    = len(chosen) = 5
+    return entropy  0.64 or narrow_gap or weak_support or short_amb or too_many
+
+def sanitize_record(rec)
+    rec     = rec if isinstance(rec, dict) else {}
+    aspects = rec.get(aspects, [])
+    aspects = [a for a in aspects if a in ASPECTS] if isinstance(aspects, list) else []
+    if not aspects
+        aspects = [none]
+    asp_sent = rec.get(aspect_sentiments, {})
+    asp_sent = asp_sent if isinstance(asp_sent, dict) else {}
+    clean = {}
+    for a in aspects
+        s = asp_sent.get(a, neutral)
+        clean[a] = s if s in SENTIMENTS else neutral
+    if none in aspects and len(aspects)  1
+        aspects = [a for a in aspects if a != none]
+        clean   = {a clean.get(a, neutral) for a in aspects}
+    return {aspects aspects, aspect_sentiments clean}
+
+def validate_predictions(records, required_ids)
+    req    = set(int(x) for x in required_ids)
+    seen, errors = set(), []
+    for i, r in enumerate(records)
+        rid = r.get(review_id)
+        if not isinstance(rid, int)
+            errors.append(frow[{i}] review_id not int)
+            continue
+        seen.add(rid)
+        if not isinstance(r.get(aspects), list) or not isinstance(r.get(aspect_sentiments), dict)
+            errors.append(freview_id={rid} invalid schema)
+            continue
+        if set(r[aspects]) != set(r[aspect_sentiments].keys())
+            errors.append(freview_id={rid} keys mismatch)
+    if seen != req
+        errors.append(review_id coverage mismatch)
+    return errors
+
+# -------------------------
+# Full Inference on ALL rows
+# -------------------------
+print(n=== Running Inference ===)
+infer_path = HIDDEN_PATH if os.path.exists(HIDDEN_PATH) else UNLABELED_PATH
+infer_df   = load_unlabeled(infer_path).copy().reset_index(drop=True)
+print(fInference on {len(infer_df)} rows from {infer_path})
+
+infer_probs = predict_aspect_probs(infer_df)
+
+pred_aspects, uncertain_flags = [], []
+for i in range(len(infer_df))
+    row_i     = infer_df.iloc[i]
+    clean_txt = row_i[clean_text]
+    sm        = {a float(infer_probs[i, j]) for j, a in enumerate(ASPECTS)}
+    short_aspects, _ = short_text_general_rule(clean_txt)
+    chosen    = short_aspects if short_aspects is not None else decode_aspects(clean_txt, sm, row_i)
+    pred_aspects.append(chosen)
+    uncertain_flags.append(is_uncertain(clean_txt, sm, chosen))
+
+pairs, pair_index = [], []
+for i, aspects in enumerate(pred_aspects)
+    for a in aspects
+        pairs.append((infer_df.iloc[i][model_text], a))
+        pair_index.append((i, a))
+
+pred_sents = predict_sentiments(pairs)
+sent_map   = {}
+for (i, a), s in zip(pair_index, pred_sents)
+    sent_map.setdefault(i, {})[a] = s
+
+records = []
+for i in range(len(infer_df))
+    clean_txt  = infer_df.iloc[i][clean_text]
+    aspects_i  = pred_aspects[i]
+    short_aspects, short_sent = short_text_general_rule(clean_txt)
+    if short_aspects is not None
+        aspects_i = short_aspects
+    sent_i = {a sent_map.get(i, {}).get(a, neutral) for a in aspects_i}
+    sent_i.update(rule_based_sentiment_hint(clean_txt, aspects_i))
+    if short_sent is not None
+        sent_i.update(short_sent)
+    base  = {
+        review_id         int(infer_df.iloc[i][review_id]),
+        aspects           aspects_i,
+        aspect_sentiments sent_i
+    }
+    clean = sanitize_record(base)
+    records.append({review_id base[review_id], aspects clean[aspects], aspect_sentiments clean[aspect_sentiments]})
+
+# Final sanitize pass
+for i in range(len(records))
+    rid        = records[i][review_id]
+    fixed      = sanitize_record(records[i])
+    records[i] = {review_id rid, aspects fixed[aspects], aspect_sentiments fixed[aspect_sentiments]}
+
+errors = validate_predictions(records, infer_df[review_id].astype(int).tolist())
+print(fValidation errors {len(errors)})
+print(fUncertain rows    {sum(uncertain_flags)})
+if errors
+    print(Sample errors, errors[10])
+
+with open(OUTPUT_JSON, w, encoding=utf-8) as f
+    json.dump(records, f, ensure_ascii=False, indent=2)
+print(fn✅ Saved {OUTPUT_JSON} — {len(records)} rows)
+
+# Sample check
+print(nSample predictions)
+for r in records[3]
+    print(r)
+
+gc.collect()
+if torch.cuda.is_available()
+    torch.cuda.empty_cache()
